@@ -1,8 +1,14 @@
 # 🥭 Mango Man - Advanced Student Assistant Bot
 
-![Mango Man PFP](https://i.ibb.co/Q7Sss5ps/mangoman.gif)
+<div align="center">
+  <img src="https://i.ibb.co/Q7Sss5ps/mangoman.gif" alt="Mango Man PFP" width="200" style="border-radius: 50%;">
+</div>
 
-**Mango Man** is a multifunctional Discord bot designed to streamline student life at Modern Academy. It integrates directly with Moodle LMS, manages assignments, downloads social media content, and provides an organized file archive—all wrapped in a sleek, automated interface.
+<br>
+
+<p align="center">
+  <strong>Mango Man</strong> is a multifunctional Discord bot designed to streamline student life at Modern Academy. It integrates directly with Moodle LMS, manages assignments, downloads social media content, and provides an organized file archive.
+</p>
 
 ## ✨ Features
 
