@@ -7,8 +7,17 @@
 <br>
 
 <p align="center">
-  <strong>Mango Man</strong> is a multifunctional Discord bot designed to streamline student life at Modern Academy. It integrates directly with Moodle LMS, manages assignments, downloads social media content, and provides an organized file archive.
+  <strong>Mango Man</strong> is a multifunctional Discord bot designed to streamline student life at Modern Academy. It integrates directly with Moodle LMS, manages assignments, downloads social media content, and provides an organized file archive—all wrapped in a sleek, automated interface.
 </p>
+
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#installation">Installation</a> •
+  <a href="#tech-stack">Tech Stack</a> •
+  <a href="#license">License</a>
+</p>
+
+---
 
 ## ✨ Features
 
@@ -38,6 +47,8 @@
 - **Manual Assignments:** Staff can add manual deadlines using `/assignment` with image attachments.
 - **Process Management:** Uses robust shell scripts (`start_bot.sh`, `stop_bot.sh`) for reliable Linux deployment.
 
+---
+
 ## 🚀 Installation & Setup
 
 ### Prerequisites
@@ -50,5 +61,64 @@
 
 1. **Clone the Repository**
    ```bash
-   git clone https://github.com/khaled-0110/mango
+   git clone https://github.com/KhaledNasserFathala/mango
    cd mango
+   ```
+
+2. **Install Dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Configure Environment**
+   Create a `.env` file in the root directory based on `.env.example`:
+   ```env
+   DISCORD_BOT_TOKEN=your_discord_bot_token
+   GUILD_ID=your_server_id
+   INSTAGRAM_API_KEY=your_rapidapi_key
+   # ... see .env.example for full list
+   ```
+
+4. **Run the Bot**
+   Use the provided shell scripts for reliable process management on Linux:
+   ```bash
+   chmod +x start_bot.sh stop_bot.sh
+   ./start_bot.sh
+   ```
+
+---
+
+## 🛠️ Tech Stack
+
+- **Language:** Python 3.10+
+- **Libraries:** `discord.py`, `python-telegram-bot`, `requests`, `pytz`, `asyncio`
+- **Deployment:** Linux VM (Azure), Bash Scripting, NoHup Process Management
+- **Data Storage:** JSON-based local storage for assignments, cache, and alerts
+
+## 📁 Project Structure
+
+```text
+Mango-Man-Bot/
+├── bot_main.py          # Main bot logic and event loops
+├── start_bot.sh         # Startup script with logging
+├── stop_bot.sh          # Graceful shutdown script
+├── requirements.txt     # Python dependencies
+├── .env.example         # Template for environment variables
+├── .gitignore           # Excludes secrets and logs
+└── README.md            # This file
+```
+
+## 🛡️ Security
+
+- **Secrets Management:** All API tokens are stored in `.env` and excluded from Git via `.gitignore`.
+- **Error Handling:** Robust try-except blocks and logging ensure the bot stays online even if APIs fail.
+
+## 📝 License
+
+This project is open-source for educational purposes.
+
+---
+
+<div align="center">
+  <sub>Built with ❤️ by <a href="https://www.linkedin.com/in/khalednasserfathala">Khaled Nasser</a></sub>
+</div>
