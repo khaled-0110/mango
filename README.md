@@ -50,5 +50,5 @@
 
 1. **Clone the Repository**
    ```bash
-   git clone https://github.com/KhaledNasserFathala/Mango-Man-Bot.git
+   git clone https://github.com/khaled-0110/mango
    cd Mango-Man-Bot
