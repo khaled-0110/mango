@@ -1,0 +1,26 @@
+# Environment Variables
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Bot Data Files (Optional: Uncomment if you want to keep data local only)
+# moodle_seen_items.json
+# assignments.json
+# library.json
+# config.json
+# sent_alerts.json
+
+# Logs
+bot.log
+*.log
+
+# Temporary Files
+temp_files/
