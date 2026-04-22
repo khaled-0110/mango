@@ -118,7 +118,7 @@ def get_tiktok_video(url):
 def get_instagram_video(url):
     host = "instagram-downloader-v2-scraper-reels-igtv-posts-stories.p.rapidapi.com"
     key = os.getenv("INSTAGRAM_API_KEY")
-
+    
     if not key:
         logger.error("Instagram: No API key found in env.")
         return None
@@ -128,14 +128,14 @@ def get_instagram_video(url):
             "x-rapidapi-key": key,
             "x-rapidapi-host": host
         }
-
+        
         response = requests.get(
-            f"https://{host}/get-post",
-            headers=headers,
-            params={"url": url},
+            f"https://{host}/get-post", 
+            headers=headers, 
+            params={"url": url}, 
             timeout=15
         )
-
+        
         if response.status_code != 200:
             logger.warning(f"Instagram API Status: {response.status_code}")
             return None
@@ -144,38 +144,40 @@ def get_instagram_video(url):
 
         if isinstance(data, dict) and "media" in data:
             media_list = data["media"]
-
+            
             for item in media_list:
                 if item.get("is_video") is True:
                     video_url = item.get("url")
                     if video_url and video_url.startswith("http"):
                         logger.info(f"✅ Instagram V2: Found video URL → {video_url[:80]}...")
                         return video_url
-
+            
             logger.warning("Instagram V2: Media found, but no video type detected.")
             return None
-
+        
         if "message" in data:
             logger.error(f"Instagram API Error Message: {data['message']}")
-
+            
         return None
 
     except Exception as e:
         logger.error(f"Instagram V2 API Exception: {e}\n{traceback.format_exc()}")
         return None
 
-# === 4. INTERACTIVE UI ===
-class FileSelectionView(discord.ui.View):
+# === 4. INTERACTIVE UI (V2 UPGRADED) ===
+
+class FileSelectionViewV2(discord.ui.View):
     def __init__(self, lookup, options):
         super().__init__(timeout=180)
         self.lookup = lookup
-        self.options = options
-        self.selected_indices = []
+        
+        # V2 Select Menu: Supports up to 100 options!
         self.file_selector = discord.ui.Select(
-            placeholder="Step 1: Pick up to 5 files...",
+            placeholder="Step 1: Pick up to 10 files...",
             min_values=1,
-            max_values=min(5, len(options)),
-            options=options
+            max_values=min(10, len(options)),
+            options=options,
+            custom_id="file_select_v2"
         )
         self.file_selector.callback = self.pick_files_callback
         self.add_item(self.file_selector)
@@ -185,7 +187,7 @@ class FileSelectionView(discord.ui.View):
         self.confirm_btn.disabled = False
         await interaction.response.edit_message(view=self)
 
-    @discord.ui.button(label="Step 2: Download Selected", style=discord.ButtonStyle.success, emoji="📥", disabled=True)
+    @discord.ui.button(label="Step 2: Download Selected", style=discord.ButtonStyle.success, emoji="📥", disabled=True, custom_id="download_btn_v2")
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         success_count = 0
@@ -193,13 +195,11 @@ class FileSelectionView(discord.ui.View):
 
         for idx in self.selected_indices:
             f_data = self.lookup.get(idx)
-            if not f_data:
-                continue
+            if not f_data: continue
             try:
                 res = await loop.run_in_executor(None, lambda u=f_data['url']: requests.get(u, timeout=20))
                 path = TEMP_DIR / f_data['name']
-                with open(path, "wb") as fh:
-                    fh.write(res.content)
+                with open(path, "wb") as fh: fh.write(res.content)
 
                 desc = f_data.get('description', '')
                 content_msg = f"📄 **Archive Request:** {f_data['name']}"
@@ -208,19 +208,18 @@ class FileSelectionView(discord.ui.View):
                 await interaction.user.send(content=content_msg, file=discord.File(path))
                 path.unlink()
                 success_count += 1
-            except Exception:
-                pass
-
+            except Exception: pass
+            
         await interaction.followup.send(f"✅ Successfully sent {success_count} files to your DMs!", ephemeral=True)
         self.stop()
 
-class PermanentFileView(discord.ui.View):
+class PermanentFileViewV2(discord.ui.View):
     def __init__(self, bot_instance):
         super().__init__(timeout=None)
         self.bot = bot_instance
 
     @discord.ui.select(
-        custom_id="permanent_subject_select",
+        custom_id="permanent_subject_select_v2",
         placeholder="📂 Browse Subject Archives...",
         options=[discord.SelectOption(label=k.title(), value=k) for k in SUBJECT_CHANNELS.keys()]
     )
@@ -232,21 +231,26 @@ class PermanentFileView(discord.ui.View):
         if not files:
             return await interaction.response.send_message(f"No files found for **{subject}** yet.", ephemeral=True)
 
-        sorted_files = sorted(files, key=lambda x: x['timestamp'], reverse=True)[:25]
+        # V2 allows up to 100 options! We show the latest 100.
+        sorted_files = sorted(files, key=lambda x: x['timestamp'], reverse=True)[:100]
         file_lookup = {str(i): f for i, f in enumerate(sorted_files)}
-
+        
         options = []
         for i, f in file_lookup.items():
             date_str = datetime.fromtimestamp(f['timestamp']).strftime('%d/%b %H:%M')
+            has_desc = " 📝" if f.get('description') else ""
+            # Truncate name to fit in V2 option label (max 100 chars)
+            label = f"{f['name'][:90]}{has_desc}"
+            
             options.append(discord.SelectOption(
-                label=(f['name'][:85] + (" 📝" if f.get('description') else "")),
+                label=label,
                 description=f"Uploaded: {date_str}",
                 value=i
             ))
 
         await interaction.response.send_message(
-            content=f"### 📂 {subject.upper()} Archive\nSelect files to receive them in DMs.",
-            view=FileSelectionView(file_lookup, options),
+            content=f"### 📂 {subject.upper()} Archive (Showing latest 100)\nSelect up to 10 files to receive them in DMs.",
+            view=FileSelectionViewV2(file_lookup, options),
             ephemeral=True
         )
 
@@ -257,7 +261,9 @@ class GigaBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        self.add_view(PermanentFileView(self))
+        # Add the V2 View for persistence
+        self.add_view(PermanentFileViewV2(self))
+        
         self.monitor_moodle.start()
         self.monitor_quizzes.start()
         self.precision_scheduler.start()
@@ -409,20 +415,46 @@ class GigaBot(discord.Client):
 
     async def refresh_master_embed(self):
         config = load_data(CONFIG_FILE)
-        chan = self.get_channel(config.get('request_channel_id'))
-        if not chan: return
+        if not config: return
+        
+        channel_id = config.get('request_channel_id')
+        message_id = config.get('master_message_id')
+        
+        if not channel_id or not message_id: return
+
         try:
-            msg = await chan.fetch_message(config.get('master_message_id'))
-            lib = load_data(LIBRARY_FILE)
-            total = sum(len(v) for v in lib.values())
+            channel = self.get_channel(channel_id)
+            if not channel: return
+            
+            msg = await channel.fetch_message(message_id)
+            
+            # Get Real-Time Data
+            library = load_data(LIBRARY_FILE)
+            total = sum(len(v) for v in library.values())
+            
+            # Create Updated Embed
             embed = discord.Embed(
                 title="🏛️ Central Study Archive",
-                description=f"📂 **Total Materials:** {total}\n🔄 **Last Update:** <t:{int(time.time())}:R>",
+                description=(
+                    "Welcome to the **Mango Man** file repository!\n\n"
+                    "📂 **How to abuse:**\n"
+                    "1. Select a **Subject** from the dropdown below.\n"
+                    "2. Choose up to **10 files** you need.\n"
+                    "3. Click **Download** to receive them in your DMs.\n\n"
+                    f"📊 **Current Status:** {total} materials archived.\n"
+                    f"🔄 **Last Updated:** <t:{int(time.time())}:R>"  # Moved here!
+                ),
                 color=discord.Color.blue()
             )
-            await msg.edit(embed=embed, view=PermanentFileView(self))
-        except Exception:
-            pass
+            embed.set_thumbnail(url="https://i.ibb.co/Q7Sss5ps/mangoman.gif")
+            embed.set_footer(text="Mango Man v1.0") # Keep footer clean
+
+            # Re-attach the View
+            view = PermanentFileViewV2(self)
+            await msg.edit(embed=embed, view=view)
+            
+        except Exception as e:
+            logger.error(f"Failed to refresh archive embed: {e}")
 
     async def process_moodle_upload(self, course_name, f_name, url, description=""):
         guild = self.get_guild(GUILD_ID)
@@ -521,6 +553,70 @@ class GigaBot(discord.Client):
 
 bot = GigaBot()
 
+# === SLASH COMMANDS ===
+
+class AssignmentModal(discord.ui.Modal, title="📝 Add New Assignment"):
+    def __init__(self, subject_value, type_value):
+        super().__init__()
+        self.subject_value = subject_value
+        self.type_value = type_value
+        
+        self.deadline = discord.ui.TextInput(
+            label="Deadline (YYYY-MM-DD)",
+            placeholder="e.g., 2026-05-20",
+            required=True,
+            min_length=10,
+            max_length=10
+        )
+        self.details = discord.ui.TextInput(
+            label="Assignment Details",
+            style=discord.TextStyle.long,
+            placeholder="Describe the assignment or paste instructions here...",
+            required=True,
+            max_length=1000
+        )
+        self.add_item(self.deadline)
+        self.add_item(self.details)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            ts = get_cairo_9am_timestamp(self.deadline.value)
+        except Exception:
+            return await interaction.response.send_message("❌ Invalid Date format. Please use YYYY-MM-DD.", ephemeral=True)
+
+        data = load_data(ASSIGNMENTS_FILE)
+        
+        # Create task object (No images for V2 modal)
+        task = {
+            "subject": self.subject_value,
+            "timestamp": int(ts),
+            "type": self.type_value,
+            "details": self.details.value,
+            "image_urls": [] 
+        }
+        
+        data.append(task)
+        save_data(ASSIGNMENTS_FILE, data)
+
+        # Send confirmation to the specific subject channel
+        chan_name = SUBJECT_CHANNELS.get(self.subject_value)
+        channel = discord.utils.get(interaction.guild.text_channels, name=chan_name)
+        
+        if channel:
+            await bot.send_stacked_embed(channel, task, "📌 NEW ASSIGNMENT LOGGED (Fast)", include_images=False)
+
+        await interaction.response.send_message(f"✅ Assignment logged for **{self.subject_value}** due <t:{ts}:F>.", ephemeral=True)
+
+@bot.tree.command(name="assignment_v2", description="Quickly add an assignment via pop-up form (No Images)")
+@app_commands.choices(subject=[app_commands.Choice(name=k.title(), value=k) for k in SUBJECT_CHANNELS.keys()])
+@app_commands.choices(type=[
+    app_commands.Choice(name="Lecture", value="Lecture"), 
+    app_commands.Choice(name="Section", value="Section")
+])
+async def assignment_v2(interaction: discord.Interaction, subject: app_commands.Choice[str], type: app_commands.Choice[str]):
+    modal = AssignmentModal(subject.value, type.value)
+    await interaction.response.send_modal(modal)
+
 @bot.tree.command(name="download", description="Download a TikTok or Instagram reel video")
 @app_commands.describe(url="The TikTok or Instagram reel URL to download")
 async def download_video(interaction: discord.Interaction, url: str):
@@ -532,40 +628,457 @@ async def download_video(interaction: discord.Interaction, url: str):
         )
     await bot.process_media(interaction, url, is_slash=True)
 
-@bot.tree.command(name="assignment", description="Add assignment")
+@bot.tree.command(name="assignment", description="Add a new assignment")
+@app_commands.describe(
+    subject="The subject name",
+    deadline="Deadline date (YYYY-MM-DD)",
+    type="Type of task",
+    details="Description or notes",
+    image1="First image (optional)",
+    image2="Second image (optional)",
+    image3="Third image (optional)",
+    image4="fourth image (optional)",
+    image5="fifth image (optional)",
+    image6="sixth image (optional)",
+    image7="seventh image (optional)",
+    image8="eightth image (optional)",
+    image9="nineth image (optional)",
+    image10="tenth image (optional)"
+)
 @app_commands.choices(subject=[app_commands.Choice(name=k.title(), value=k) for k in SUBJECT_CHANNELS.keys()])
-@app_commands.choices(type=[app_commands.Choice(name="Lecture", value="Lecture"), app_commands.Choice(name="Section", value="Section")])
-async def add_assignment(interaction: discord.Interaction, subject: app_commands.Choice[str], deadline: str, type: app_commands.Choice[str], details: str, image1: discord.Attachment = None):
+@app_commands.choices(type=[
+    app_commands.Choice(name="Lecture", value="Lecture"), 
+    app_commands.Choice(name="Section", value="Section")
+])
+async def add_assignment(
+    interaction: discord.Interaction, 
+    subject: app_commands.Choice[str], 
+    deadline: str, 
+    type: app_commands.Choice[str], 
+    details: str, 
+    image1: discord.Attachment = None,
+    image2: discord.Attachment = None,
+    image3: discord.Attachment = None,
+    image4: discord.Attachment = None,
+    image5: discord.Attachment = None,
+    image6: discord.Attachment = None,
+    image7: discord.Attachment = None,
+    image8: discord.Attachment = None,
+    image9: discord.Attachment = None,
+    image10: discord.Attachment = None
+):
     try:
         ts = get_cairo_9am_timestamp(deadline)
     except Exception:
-        return await interaction.response.send_message("❌ Use YYYY-MM-DD.", ephemeral=True)
+        return await interaction.response.send_message("❌ Invalid Date. Use YYYY-MM-DD format.", ephemeral=True)
+
+    # Collect all valid image URLs
+    images = []
+    if image1: images.append(image1.url)
+    if image2: images.append(image2.url)
+    if image3: images.append(image3.url)
+    if image4: images.append(image4.url)
+    if image5: images.append(image5.url)
+    if image6: images.append(image6.url)
+    if image7: images.append(image7.url)
+    if image8: images.append(image8.url)
+    if image9: images.append(image9.url)
+    if image10: images.append(image10.url)
 
     data = load_data(ASSIGNMENTS_FILE)
+    
+    # Create the task object
     task = {
         "subject": subject.value,
         "timestamp": int(ts),
         "type": type.value,
         "details": details,
-        "image_urls": [image1.url] if image1 else []
+        "image_urls": images
     }
+    
     data.append(task)
     save_data(ASSIGNMENTS_FILE, data)
 
+    # Send confirmation to the specific subject channel
+    chan_name = SUBJECT_CHANNELS.get(subject.value)
+    channel = discord.utils.get(interaction.guild.text_channels, name=chan_name)
+    
+    if channel:
+        await bot.send_stacked_embed(channel, task, "📌 NEW ASSIGNMENT LOGGED", include_images=True)
+
+    await interaction.response.send_message(f"✅ Assignment logged for **{subject.name}** due <t:{ts}:F>.", ephemeral=True)
+
+
+@bot.tree.command(name="delete_assignment", description="Delete an active assignment")
+@app_commands.describe(subject="The subject of the assignment", deadline="The deadline date (YYYY-MM-DD)")
+@app_commands.choices(subject=[app_commands.Choice(name=k.title(), value=k) for k in SUBJECT_CHANNELS.keys()])
+async def delete_assignment(interaction: discord.Interaction, subject: app_commands.Choice[str], deadline: str):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only!", ephemeral=True)
+
+    try:
+        target_ts = get_cairo_9am_timestamp(deadline)
+    except Exception:
+        return await interaction.response.send_message("❌ Invalid Date. Use YYYY-MM-DD.", ephemeral=True)
+
+    data = load_data(ASSIGNMENTS_FILE)
+    initial_len = len(data)
+    
+    # Filter out the specific assignment
+    new_data = [t for t in data if not (t['subject'] == subject.value and t['timestamp'] == target_ts)]
+    
+    if len(new_data) == initial_len:
+        return await interaction.response.send_message("❌ No active assignment found with that subject and deadline.", ephemeral=True)
+
+    save_data(ASSIGNMENTS_FILE, new_data)
+    await interaction.response.send_message(f"✅ Deleted assignment for **{subject.name}** due <t:{target_ts}:F>.", ephemeral=True)
+
+
+@bot.tree.command(name="edit_assignment", description="Edit details or deadline of an assignment")
+@app_commands.describe(
+    subject="Current subject",
+    old_deadline="Current deadline (YYYY-MM-DD)",
+    new_details="New description (leave blank to keep current)",
+    new_deadline="New deadline (YYYY-MM-DD) (leave blank to keep current)",
+    new_image1="New image 1 (optional)"
+)
+@app_commands.choices(subject=[app_commands.Choice(name=k.title(), value=k) for k in SUBJECT_CHANNELS.keys()])
+async def edit_assignment(
+    interaction: discord.Interaction, 
+    subject: app_commands.Choice[str], 
+    old_deadline: str, 
+    new_details: str = "", 
+    new_deadline: str = "",
+    new_image1: discord.Attachment = None
+):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("❌ Admins only!", ephemeral=True)
+
+    try:
+        old_ts = get_cairo_9am_timestamp(old_deadline)
+    except Exception:
+        return await interaction.response.send_message("❌ Invalid Old Date. Use YYYY-MM-DD.", ephemeral=True)
+
+    data = load_data(ASSIGNMENTS_FILE)
+    found = False
+    
+    for task in data:
+        if task['subject'] == subject.value and task['timestamp'] == old_ts:
+            found = True
+            # Update fields if provided
+            if new_details:
+                task['details'] = new_details
+            
+            if new_deadline:
+                try:
+                    task['timestamp'] = int(get_cairo_9am_timestamp(new_deadline))
+                except:
+                    return await interaction.response.send_message("❌ Invalid New Date.", ephemeral=True)
+            
+            if new_image1:
+                task['image_urls'] = [new_image1.url] # Replace images for simplicity
+                
+            break
+
+    if not found:
+        return await interaction.response.send_message("❌ Assignment not found.", ephemeral=True)
+
+    save_data(ASSIGNMENTS_FILE, data)
+    await interaction.response.send_message("✅ Assignment updated successfully!", ephemeral=True)
+    
+    # Re-post the updated embed to the channel
     chan_name = SUBJECT_CHANNELS.get(subject.value)
     channel = discord.utils.get(interaction.guild.text_channels, name=chan_name)
     if channel:
-        await bot.send_stacked_embed(channel, task, "📌 NEW ASSIGNMENT LOGGED")
+        # Find the updated task again to send embed
+        for task in data:
+            if task['subject'] == subject.value and task['timestamp'] == (int(get_cairo_9am_timestamp(new_deadline)) if new_deadline else old_ts):
+                await bot.send_stacked_embed(channel, task, "🔄 ASSIGNMENT UPDATED", include_images=True)
+                break
 
-    await interaction.response.send_message("✅ Logged!", ephemeral=True)
+@bot.tree.command(name="list_assignments", description="View all active assignments and quizzes")
+async def list_assignments(interaction: discord.Interaction):
+    data = load_data(ASSIGNMENTS_FILE)
+    
+    if not data:
+        return await interaction.response.send_message("📭 No active assignments or quizzes found.", ephemeral=True)
 
-@bot.tree.command(name="setup_archive", description="Init archive")
+    # Sort by timestamp (soonest first)
+    sorted_data = sorted(data, key=lambda x: x['timestamp'])
+    
+    # Group by subject for cleaner display
+    subjects = {}
+    for task in sorted_data:
+        subj = task['subject']
+        if subj not in subjects:
+            subjects[subj] = []
+        subjects[subj].append(task)
+
+    embeds = []
+    current_embed = discord.Embed(title="📋 Active Assignments & Quizzes", color=discord.Color.blue())
+    char_count = 0
+    
+    for subj, tasks in subjects.items():
+        field_value = ""
+        for t in tasks:
+            ts = t['timestamp']
+            status_icon = "🚨" if ts < time.time() else ("⚠️" if (ts - time.time()) < 86400 else "✅")
+            deadline_str = f"<t:{ts}:F>"
+            relative_str = f"<t:{ts}:R>"
+            
+            # Format: [Icon] **Type**: Details | Due: Time
+            line = f"{status_icon} **{t.get('type', 'Task')}**: {t['details'][:50]}{'...' if len(t['details'])>50 else ''}\n   └ Due: {deadline_str} ({relative_str})\n\n"
+            
+            # Check if adding this line exceeds Discord's limit (1024 chars per field)
+            if len(field_value) + len(line) > 1024:
+                # Add current field to embed
+                current_embed.add_field(name=f"📘 {subj.title()}", value=field_value, inline=False)
+                char_count += len(field_value)
+                
+                # If embed is getting full (6000 chars total), start a new one
+                if char_count > 5000:
+                    embeds.append(current_embed)
+                    current_embed = discord.Embed(title="📋 Active Assignments (Cont.)", color=discord.Color.blue())
+                    char_count = 0
+                
+                field_value = line
+            else:
+                field_value += line
+        
+        # Add remaining field for this subject
+        if field_value:
+            current_embed.add_field(name=f"📘 {subj.title()}", value=field_value, inline=False)
+
+    if current_embed.fields:
+        embeds.append(current_embed)
+
+    # Send the first embed immediately, then follow up with others if they exist
+    await interaction.response.send_message(embed=embeds[0], ephemeral=True)
+    for embed in embeds[1:]:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="view_assignments", description="Browse and view details of manual assignments privately")
+async def view_assignments(interaction: discord.Interaction):
+    data = load_data(ASSIGNMENTS_FILE)
+    
+    # Filter out Moodle Quizzes to show only manual assignments
+    manual_assignments = [t for t in data if t.get('type') != 'Moodle Quiz']
+    
+    if not manual_assignments:
+        return await interaction.response.send_message("📭 No manual assignments found.", ephemeral=True)
+
+    # Sort by deadline (soonest first)
+    sorted_assignments = sorted(manual_assignments, key=lambda x: x['timestamp'])
+    
+    # Create lookup dictionary for easy retrieval
+    assignment_lookup = {str(i): t for i, t in enumerate(sorted_assignments)}
+    
+    # Create options for the dropdown
+    options = []
+    for i, t in enumerate(sorted_assignments):
+        ts = t['timestamp']
+        img_count = len(t.get('image_urls', []))
+        img_icon = f" 📷{img_count}" if img_count > 0 else ""
+        
+        subj_name = t['subject'].title()[:40]
+        
+        options.append(discord.SelectOption(
+            label=f"{subj_name} | <t:{ts}:R>{img_icon}",
+            description=f"Due: <t:{ts}:F> | Type: {t.get('type', 'Task')}",
+            value=str(i)
+        ))
+
+    class AssignmentView(discord.ui.View):
+        def __init__(self, lookup):
+            super().__init__(timeout=180)
+            self.lookup = lookup
+            
+        @discord.ui.select(
+            placeholder="Select an assignment to view details...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+        async def select_assignment(self, interaction: discord.Interaction, select: discord.ui.Select):
+            idx = select.values[0]
+            task = self.lookup.get(idx)
+            
+            if not task:
+                return await interaction.response.send_message("❌ Error loading assignment.", ephemeral=True)
+            
+            # Construct the embed manually to ensure it's clean and ephemeral
+            col, stat = get_status_ui(task['timestamp'])
+            embeds = []
+            
+            main = discord.Embed(title="📌 ASSIGNMENT DETAILS", color=col)
+            main.add_field(name="📘 Subject", value=f"**{task['subject'].upper()}**", inline=False)
+            main.add_field(name="📊 Status", value=f"**{stat}**", inline=True)
+            main.add_field(name="📍 Type", value=task.get('type', 'Assignment'), inline=True)
+            main.add_field(name="⏳ Submission", value=f"<t:{task['timestamp']}:F>\n(<t:{task['timestamp']}:R>)", inline=False)
+            main.add_field(name="📝 Details", value=task.get('details', 'No details'), inline=False)
+            
+            imgs = task.get('image_urls', [])
+            if imgs:
+                main.set_image(url=imgs[0])
+                embeds.append(main)
+                # Add additional images as separate embeds if they exist
+                for u in imgs[1:]:
+                    extra = discord.Embed(color=col)
+                    extra.set_image(url=u)
+                    embeds.append(extra)
+            else:
+                embeds.append(main)
+                
+            # Send as EPHEMERAL followup (Visible ONLY to the user who clicked)
+            # No content/mention is added here, just the embeds
+            await interaction.response.send_message(embeds=embeds, ephemeral=True)
+
+    # Send the initial message with the dropdown (also ephemeral so it doesn't clutter chat)
+    await interaction.response.send_message(
+        content="### 📋 Select an Assignment\nChoose below to view its full details and images privately.",
+        view=AssignmentView(assignment_lookup),
+        ephemeral=True
+    )
+
+@bot.tree.command(name="list_quizzes", description="View only active Moodle Quizzes")
+async def list_quizzes(interaction: discord.Interaction):
+    data = load_data(ASSIGNMENTS_FILE)
+    
+    # Filter only items where type is 'Moodle Quiz'
+    quizzes = [t for t in data if t.get('type') == 'Moodle Quiz']
+    
+    if not quizzes:
+        return await interaction.response.send_message("📭 No active Moodle Quizzes found.", ephemeral=True)
+
+    # Sort by timestamp (soonest first)
+    sorted_quizzes = sorted(quizzes, key=lambda x: x['timestamp'])
+    
+    embed = discord.Embed(title="📝 Active Moodle Quizzes", color=discord.Color.purple())
+    
+    for q in sorted_quizzes:
+        ts = q['timestamp']
+        status_icon = "🚨" if ts < time.time() else ("⚠️" if (ts - time.time()) < 86400 else "✅")
+        
+        # Format details
+        name = q['details'].replace("📝 **", "").replace("**", "") # Clean up bold markers if present
+        
+        field_value = f"{status_icon} **{name}**\n   └ Due: <t:{ts}:F> (<t:{ts}:R>)"
+        
+        # Add field to embed
+        embed.add_field(name=f"📘 {q['subject'].title()}", value=field_value, inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="help", description="Display the user guide and command list")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🥭 Mango Man User Guide",
+        description="Welcome! I am here to streamline your study life at Zingy Academy. Here is how you can abuse me:",
+        color=discord.Color.gold()
+    )
+
+    # Load Config for Archive Channel Link
+    config = load_data(CONFIG_FILE)
+    archive_channel_id = config.get("request_channel_id")
+    if archive_channel_id:
+        archive_link = f"<#{archive_channel_id}>"
+    else:
+        archive_link = "#setup-archive-channel"
+
+    embed.add_field(
+        name="📚 Assignments & Reminders",
+        value=(
+            "• `/assignment` - Log a new manual deadline with **up to 10 images**.\n"
+            "• `/delete_assignment` - Remove an active assignment.\n"
+            "• `/edit_assignment` - Update details or deadline of a task.\n"
+            "• `/list_assignments` - View all upcoming tasks & quizzes.\n"
+            "• `/list_quizzes` - View only Moodle Quizzes.\n"
+            "• `/view_assignments` - Browse manual assignments privately."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📂 Moodle File Archive",
+        value=(
+            "• **Auto-Sync:** I automatically download new PDFs/PPTs from Moodle.\n"
+            f"• **Browse Files:** Use the dropdown menu in {archive_link} to select a subject.\n"
+            "• **Download:** Select up to 10 files, and I will DM them to you with professor notes if there are any."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📱 Social Media Downloader",
+        value=(
+            "• `/download [url]` - Download TikTok or Instagram Reels without watermarks.\n"
+            f"• **Auto-Forward:** Send links in <#{discord.utils.get(interaction.guild.text_channels, name=LISTEN_CHANNEL_NAME).id}> to auto-download."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="Mango Man v1.0")
+    embed.set_thumbnail(url="https://i.ibb.co/Q7Sss5ps/mangoman.gif")
+
+    # Create the GitHub Button
+    github_button = discord.ui.Button(
+        label="View Bot's REPO", 
+        url="https://github.com/khaled-0110/mango", 
+        style=discord.ButtonStyle.link, 
+        emoji="🐙"
+    )
+    
+    view = discord.ui.View()
+    view.add_item(github_button)
+
+    # 1. Send Embed + Button Publicly
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+    
+    # 2. Send the Clickable Mention Below
+    developer_mention = f"<@{interaction.user.id}>"
+    await interaction.followup.send(content=f"Developed by {developer_mention}", ephemeral=False)
+
+
+@bot.tree.command(name="setup_archive", description="Initialize or update the study archive menu")
 async def setup_archive(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Admins only!", ephemeral=True)
-    msg = await interaction.channel.send(embed=discord.Embed(title="🏛️ Archive"), view=PermanentFileView(bot))
-    save_data(CONFIG_FILE, {"master_message_id": msg.id, "request_channel_id": interaction.channel_id})
-    await interaction.response.send_message("✅ Done!", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Initial Data
+    library = load_data(LIBRARY_FILE)
+    total_files = sum(len(files) for files in library.values())
+
+    embed = discord.Embed(
+        title="🏛️ Central Study Archive",
+        description=(
+            "Welcome to the **Mango Man** file repository!\n\n"
+            "📂 **How to abuse:**\n"
+            "1. Select a **Subject** from the dropdown below.\n"
+            "2. Choose up to **10 files** you need.\n"
+            "3. Click **Download** to receive them in your DMs.\n\n"
+            f"📊 **Current Status:** {total_files} materials archived.\n"
+            f"🔄 **Last Updated:** <t:{int(time.time())}:R>" # Moved here!
+        ),
+        color=discord.Color.blue()
+    )
+    embed.set_thumbnail(url="https://i.ibb.co/Q7Sss5ps/mangoman.gif")
+    embed.set_footer(text="Mango Man v1.0") # Keep footer clean
+
+    # Create View
+    view = PermanentFileViewV2(bot)
+
+    # Send Message
+    msg = await interaction.channel.send(embed=embed, view=view)
+    
+    # Save Config
+    save_data(CONFIG_FILE, {
+        "master_message_id": msg.id, 
+        "request_channel_id": interaction.channel_id
+    })
+
+    await interaction.followup.send("✅ Archive menu initialized!", ephemeral=True)
 
 async def tg_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
