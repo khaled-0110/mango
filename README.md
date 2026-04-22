@@ -32,9 +32,10 @@
 - **Urgent Warnings:** Sends a "Final Warning" exactly 90 minutes before a deadline.
 - **Status Tracking:** Visual indicators for "On Track" (🟢), "Due Soon" (🟠), and "Overdue" (🔴).
 
-### 📂 Central Study Archive
+### 📂 Central Study Archive (V2)
 - **Persistent Library:** Stores all downloaded Moodle files in a searchable JSON database.
 - **Interactive UI:** Users can browse subjects via dropdown menus, select up to 5 files, and receive them directly via DM.
+- **Auto-Updating Stats:** The archive message automatically updates its file count and "Last Updated" timer every 30 minutes.
 - **Metadata Support:** Includes professor instructions/descriptions with downloaded files for context.
 
 ### 📱 Social Media Downloader
@@ -43,8 +44,11 @@
 - **Telegram Bridge:** Forwards TikTok/Instagram links from a Telegram group to Discord seamlessly.
 
 ### 🛠️ Admin & Utility Tools
+- **Dual Assignment System:** 
+  - `/assignment`: Add tasks with **up to 3 images**.
+  - `/assignment_v2`: Quick-add tasks via a **pop-up form**.
+- **Management Commands:** `/edit_assignment`, `/delete_assignment`, `/list_assignments`, and `/list_quizzes`.
 - **DM Logging:** Logs all bot DMs to a private admin channel for support and monitoring.
-- **Manual Assignments:** Staff can add manual deadlines using `/assignment` with image attachments.
 - **Process Management:** Uses robust shell scripts (`start_bot.sh`, `stop_bot.sh`) for reliable Linux deployment.
 
 ---
@@ -61,8 +65,8 @@
 
 1. **Clone the Repository**
    ```bash
-   git clone https://github.com/KhaledNasserFathala/mango
-   cd mango
+   git clone https://github.com/khaled-0110/mango
+   cd Mango-Man-Bot
    ```
 
 2. **Install Dependencies**
@@ -91,9 +95,10 @@
 ## 🛠️ Tech Stack
 
 - **Language:** Python 3.10+
-- **Libraries:** `discord.py`, `python-telegram-bot`, `requests`, `pytz`, `asyncio`
+- **Libraries:** `discord.py` (v2.4+), `python-telegram-bot`, `requests`, `pytz`, `asyncio`
 - **Deployment:** Linux VM (Azure), Bash Scripting, NoHup Process Management
 - **Data Storage:** JSON-based local storage for assignments, cache, and alerts
+- **UI Components:** Discord Components V2 (Select Menus, Modals, Buttons)
 
 ## 📁 Project Structure
 
