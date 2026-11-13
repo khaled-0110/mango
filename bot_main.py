@@ -1,8 +1,8 @@
-
 import os
 import re
 import json
 import asyncio
+import random
 import requests
 import discord
 import threading
@@ -21,8 +21,10 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from discord.ext import tasks
 from discord import app_commands
 from playwright.async_api import async_playwright
+from urllib.parse import urlparse, parse_qs
 
 download_lock = asyncio.Lock()
+
 # ==============================================================================
 # 1. LOGGING & ENVIRONMENT
 # ==============================================================================
@@ -76,7 +78,7 @@ SUBJECT_CHANNELS = {
     "web design": "🍆web-dick-sign"
 }
 
-# --- File Paths ---
+# --- File Paths & Downloader Config ---
 MOODLE_CACHE = "moodle_seen_items.json"
 ASSIGNMENTS_FILE = "assignments.json"
 LIBRARY_FILE = "moodle_files_library.json"
@@ -85,6 +87,17 @@ ALERTS_FILE = "sent_alerts.json"
 MOODLE_ALERTS_FILE = "moodle_alerts_sent.json"
 TEMP_DIR = Path(__file__).parent / "temp_files"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+YT_DLP_BIN = "/home/GIGA/bot_env/bin/yt-dlp"
+IG_COOKIES_PATH = "/home/GIGA/cookies.txt"
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+INSTAGRAM_FALLBACK_APIS = [
+    {
+        "name": "Instagram Downloader v2",
+        "url": "https://instagram-downloader-v2-scraper-reels-igtv-posts-stories.p.rapidapi.com/get-post",  # <-- REPLACE WITH RAPIDAPI ENDPOINT URL
+        "host": "instagram-downloader-v2-scraper-reels-igtv-posts-stories.p.rapidapi.com",                          # <-- REPLACE WITH X-RAPIDAPI-HOST
+    },
+]
 
 # ==============================================================================
 # 3. UTILITIES
@@ -125,13 +138,10 @@ def get_status_ui(target_ts: int):
         return discord.Color.orange(), "⚠️ DUE SOON"
     else:
         return discord.Color.green(), "✅ ON TRACK"
+
 # ==============================================================================
 # 4. SMART FALLBACK DOWNLOAD LOGIC
 # ==============================================================================
-def extract_instagram_shortcode(url: str):
-    match = re.search(r'(?:reel|p)/([A-Za-z0-9_-]+)', url)
-    return match.group(1) if match else None
-
 def format_count(count):
     """Formats numbers like 43000 to 43.0K"""
     if count is None:
@@ -144,39 +154,94 @@ def format_count(count):
 
 def get_video_metadata(url: str):
     """Fetches video metadata (author, stats, description) using yt-dlp"""
+    cmd = [YT_DLP_BIN, "-J", "--no-warnings"]
+    if "instagram.com" in url and os.path.exists(IG_COOKIES_PATH):
+        cmd.extend(["--cookies", IG_COOKIES_PATH])
+    cmd.append(url)
+
     try:
-        result = subprocess.run(
-            # ADDED: --cookies argument
-            ["yt-dlp", "-J", "--no-warnings", "--cookies", "/home/GIGA/cookies.txt", url],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             return json.loads(result.stdout)
-        else:
-            logger.error(f"yt-dlp failed for {url}. Error: {result.stderr.strip()}")
-            return None
+        logger.error(f"yt-dlp metadata failed for {url}: {result.stderr.strip()}")
+        return None
     except Exception as e:
         logger.error(f"yt-dlp metadata exception: {e}")
         return None
 
 def download_video_file(url: str, filepath: str):
-    cmd = ["yt-dlp", "-f", "best", "-o", filepath, "--no-warnings"]
+    cmd = [
+        YT_DLP_BIN,
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--ffmpeg-location", "/usr/bin/ffmpeg",
+        "-o", filepath,
+        "--no-warnings",
+    ]
 
-    # Pass proxy if downloading from YouTube
-    if "youtube.com" in url or "youtu.be" in url:
-        # Example proxy usage (replace with your proxy address if available)
+    if "instagram.com" in url and os.path.exists(IG_COOKIES_PATH):
+        cmd.extend(["--cookies", IG_COOKIES_PATH])
+    elif "youtube.com" in url or "youtu.be" in url:
         cmd.extend(["--proxy", "http://your_proxy_ip:port"])
 
     cmd.append(url)
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            logger.error(f"yt-dlp download failed for {url}: {result.stderr.strip()}")
         return result.returncode == 0
     except Exception as e:
         logger.error(f"yt-dlp download error: {e}")
         return False
+
+async def download_instagram_via_rapidapi(url: str, filepath: str):
+    """Fallback Instagram downloader matching the updated v2 API schema."""
+    if not RAPIDAPI_KEY:
+        logger.warning("RAPIDAPI_KEY not set in .env; skipping RapidAPI fallback.")
+        return None, None
+
+    async with aiohttp.ClientSession() as session:
+        for api in INSTAGRAM_FALLBACK_APIS:
+            if "YOUR_RAPIDAPI_HOST" in api["host"]:
+                logger.warning(f"{api['name']} host is not configured yet; skipping.")
+                continue
+
+            headers = {
+                "x-rapidapi-key": RAPIDAPI_KEY,
+                "x-rapidapi-host": api["host"],
+            }
+            try:
+                async with session.get(api["url"], headers=headers, params={"url": url}, timeout=25) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"{api['name']} returned HTTP {resp.status}")
+                        continue
+                    data = await resp.json()
+
+                video_item = next((m for m in data.get("media", []) if m.get("is_video") and m.get("url")), None)
+                if not video_item:
+                    continue
+
+                video_url = video_item["url"]
+                async with session.get(video_url, timeout=60) as file_resp:
+                    if file_resp.status != 200:
+                        continue
+                    with open(filepath, "wb") as f:
+                        f.write(await file_resp.read())
+
+                meta = {
+                    "uploader": (data.get("owner") or {}).get("username", "Unknown"),
+                    "description": video_item.get("caption") or "No description",
+                    "like_count": 0,
+                    "comment_count": 0,
+                    "share_count": 0,
+                }
+                logger.info(f"✅ Downloaded Instagram video via {api['name']}")
+                return meta, video_url
+            except Exception as e:
+                logger.error(f"{api['name']} fallback error: {e}")
+
+    return None, None
 
 async def download_youtube_via_cobalt(url: str, filepath: str) -> bool:
     """Downloads YouTube videos using the cobalt.tools API to bypass Azure IP bans"""
@@ -187,7 +252,7 @@ async def download_youtube_via_cobalt(url: str, filepath: str) -> bool:
         }
         data = {
             "url": url,
-            "videoQuality": "720", # 720p is a good balance of quality and file size (<20MB)
+            "videoQuality": "720",
             "audioFormat": "mp3",
             "filenamePattern": "basic"
         }
@@ -196,10 +261,8 @@ async def download_youtube_via_cobalt(url: str, filepath: str) -> bool:
             async with session.post("https://api.cobalt.tools/", json=data, headers=headers, timeout=30) as resp:
                 if resp.status == 200:
                     result = await resp.json()
-                    if result.get("status") == "stream" or result.get("status") == "redirect":
+                    if result.get("status") in ("stream", "redirect"):
                         download_url = result.get("url")
-
-                        # Download the actual file
                         async with session.get(download_url, timeout=60) as file_resp:
                             if file_resp.status == 200:
                                 with open(filepath, "wb") as f:
@@ -209,8 +272,57 @@ async def download_youtube_via_cobalt(url: str, filepath: str) -> bool:
     except Exception as e:
         logger.error(f"Cobalt download error for {url}: {e}")
         return False
+async def resolve_short_url(url: str) -> str:
+    """Expands short share links (fb.watch, pin.it, vm/vt.tiktok.com) to canonical URLs."""
+    short_domains = ("fb.watch", "pin.it", "vm.tiktok.com", "vt.tiktok.com")
+    if not any(d in url.lower() for d in short_domains):
+        return url
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, allow_redirects=True, timeout=10) as resp:
+                return str(resp.url)
+    except Exception as e:
+        logger.warning(f"Failed to expand short URL {url}: {e}")
+        return url
 
+async def get_embed_proxy_url(url: str) -> str | None:
+    """Converts a social media URL into a Discord-playable OpenGraph proxy URL."""
+    resolved = await resolve_short_url(url.strip())
+    parsed = urlparse(resolved)
+    host = parsed.netloc.lower()
+    path = parsed.path
 
+    # 1. Instagram -> www.zzinstagram.com (strip tracking query params)
+    if "instagram.com" in host:
+        return f"https://www.zzinstagram.com{path}"
+
+    # 2. YouTube -> www.koutube.com (keep video ID for /watch, strip extra params)
+    if "youtu.be" in host:
+        video_id = path.strip("/").split("/")[0]
+        return f"https://www.koutube.com/watch?v={video_id}" if video_id else None
+    if "youtube.com" in host:
+        if path.startswith("/watch"):
+            v_id = parse_qs(parsed.query).get("v", [None])[0]
+            return f"https://www.koutube.com/watch?v={v_id}" if v_id else None
+        return f"https://www.koutube.com{path}"
+
+    # 3. Facebook -> facebed.com (preserve ?v= or ?story_fbid= when present)
+    if "facebook.com" in host:
+        qs = parse_qs(parsed.query)
+        kept = {k: qs[k][0] for k in ("v", "story_fbid", "id") if k in qs}
+        query_str = f"?{'&'.join(f'{k}={v}' for k, v in kept.items())}" if kept else ""
+        return f"https://facebed.com{path}{query_str}"
+
+    # 4. TikTok -> www.vxtiktok.com (strip tracking query params)
+    if "tiktok.com" in host:
+        return f"https://www.vxtiktok.com{path}"
+
+    # 5. Pinterest -> canonical clean pin URL for Discord's native OpenGraph embed
+    if "pinterest." in host and "/pin/" in path:
+        return f"https://www.pinterest.com{path}"
+
+    return None
 # ==============================================================================
 # 5. INTERACTIVE UI
 # ==============================================================================
@@ -241,18 +353,22 @@ class FileSelectionViewV2(discord.ui.View):
         loop = asyncio.get_event_loop()
         for idx in self.selected_indices:
             f_data = self.lookup.get(idx)
-            if not f_data: continue
+            if not f_data:
+                continue
             try:
                 res = await loop.run_in_executor(None, lambda u=f_data['url']: requests.get(u, timeout=20))
                 path = TEMP_DIR / f_data['name']
-                with open(path, "wb") as fh: fh.write(res.content)
+                with open(path, "wb") as fh:
+                    fh.write(res.content)
                 desc = f_data.get('description', '')
                 content_msg = f"📄 **Archive Request:** {f_data['name']}"
-                if desc: content_msg += f"\n\n📝 **Instructions:**\n{desc}"
+                if desc:
+                    content_msg += f"\n\n📝 **Instructions:**\n{desc}"
                 await interaction.user.send(content=content_msg, file=discord.File(path))
                 path.unlink()
                 success_count += 1
-            except Exception: pass
+            except Exception:
+                pass
         await interaction.followup.send(f"✅ Successfully sent {success_count} files to your DMs!", ephemeral=True)
         self.stop()
 
@@ -307,8 +423,6 @@ class GigaBot(discord.Client):
         self.monitor_quizzes.start()
         self.precision_scheduler.start()
 
-        # --- GLOBAL COMMAND SYNC ONLY ---
-        # This registers commands globally, making them available in DMs and all servers.
         try:
             synced_commands = await self.tree.sync()
             logger.info(f"✅ Global command sync complete ({len(synced_commands)} commands registered).")
@@ -387,27 +501,41 @@ class GigaBot(discord.Client):
     async def monitor_moodle(self):
         await self.wait_until_ready()
         token, base_url = os.getenv("MOODLE_TOKEN"), os.getenv("MOODLE_URL")
-        if not token or not base_url: return
+        if not token or not base_url:
+            return
         api_url = f"{base_url}/webservice/rest/server.php"
         loop = asyncio.get_event_loop()
 
         try:
             seen_data = load_data(MOODLE_CACHE)
             library = load_data(LIBRARY_FILE)
-            params = {'wstoken': token, 'wsfunction': 'core_course_get_enrolled_courses_by_timeline_classification', 'moodlewsrestformat': 'json', 'classification': 'all'}
+            params = {
+                'wstoken': token,
+                'wsfunction': 'core_course_get_enrolled_courses_by_timeline_classification',
+                'moodlewsrestformat': 'json',
+                'classification': 'all'
+            }
             res = (await loop.run_in_executor(None, lambda: requests.get(api_url, params=params))).json()
             courses = res.get('courses', []) if isinstance(res, dict) else []
 
             for course in courses:
                 c_id = str(course.get('id'))
                 c_name = course.get('fullname', 'Unknown')
-                sec_params = {'wstoken': token, 'wsfunction': 'core_course_get_contents', 'moodlewsrestformat': 'json', 'courseid': c_id}
+                sec_params = {
+                    'wstoken': token,
+                    'wsfunction': 'core_course_get_contents',
+                    'moodlewsrestformat': 'json',
+                    'courseid': c_id
+                }
                 sec_res = (await loop.run_in_executor(None, lambda: requests.get(api_url, params=sec_params))).json()
-                if not isinstance(sec_res, list): continue
+                if not isinstance(sec_res, list):
+                    continue
 
-                if c_id not in seen_data: seen_data[c_id] = []
+                if c_id not in seen_data:
+                    seen_data[c_id] = []
                 subj_key = self.match_subj(c_id, courses)
-                if subj_key not in library: library[subj_key] = []
+                if subj_key not in library:
+                    library[subj_key] = []
 
                 for sec in sec_res:
                     for mod in sec.get('modules', []):
@@ -488,7 +616,12 @@ class GigaBot(discord.Client):
                                         if not existing_file.get('description') and clean_desc:
                                             existing_file['description'] = clean_desc
                                     else:
-                                        library[subj_key].append({"name": f_name, "url": f_url, "timestamp": time.time(), "description": clean_desc})
+                                        library[subj_key].append({
+                                            "name": f_name,
+                                            "url": f_url,
+                                            "timestamp": time.time(),
+                                            "description": clean_desc
+                                        })
                                         await self.process_moodle_upload(c_name, f_name, f_url, clean_desc)
                             elif subj_key == "field training 2" and mod.get("modname") != "assign":
                                 mod_name = mod.get('modname', 'Activity')
@@ -497,11 +630,20 @@ class GigaBot(discord.Client):
                                 raw_text = mod.get('description', '') or mod.get('intro', '')
                                 clean_desc = " ".join(html.unescape(re.sub('<[^<]+?>', '', raw_text)).split()) if raw_text else ""
                                 details = f"🔗 **Link:** [Open Activity]({actual_url})"
-                                if clean_desc: details += f"\n\n📝 **Details:**\n{clean_desc[:500]}"
-                                task = {"subject": subj_key, "timestamp": int(time.time()), "type": mod_name.capitalize(), "details": details, "image_urls": []}
+                                if clean_desc:
+                                    details += f"\n\n📝 **Details:**\n{clean_desc[:500]}"
+                                task = {
+                                    "subject": subj_key,
+                                    "timestamp": int(time.time()),
+                                    "type": mod_name.capitalize(),
+                                    "details": details,
+                                    "image_urls": []
+                                }
                                 chan = discord.utils.get(self.get_guild(GUILD_ID).text_channels, name=SUBJECT_CHANNELS.get(subj_key))
-                                if chan: await self.send_stacked_embed(chan, task, f"🆕 NEW {mod_name.upper()} DETECTED")
-                        if m_id not in seen_data[c_id]: seen_data[c_id].append(m_id)
+                                if chan:
+                                    await self.send_stacked_embed(chan, task, f"🆕 NEW {mod_name.upper()} DETECTED")
+                        if m_id not in seen_data[c_id]:
+                            seen_data[c_id].append(m_id)
 
             save_data(MOODLE_CACHE, seen_data)
             save_data(LIBRARY_FILE, library)
@@ -513,7 +655,8 @@ class GigaBot(discord.Client):
     async def monitor_quizzes(self):
         await self.wait_until_ready()
         token, base_url = os.getenv("MOODLE_TOKEN"), os.getenv("MOODLE_URL")
-        if not token or not base_url: return
+        if not token or not base_url:
+            return
         api_url = f"{base_url}/webservice/rest/server.php"
         loop = asyncio.get_event_loop()
         try:
@@ -613,13 +756,16 @@ class GigaBot(discord.Client):
         now = int(time.time())
         c_now = datetime.now(CAIRO_TZ)
         guild = self.get_guild(GUILD_ID)
-        if not guild: return
+        if not guild:
+            return
         rem = []
         sent_alerts = load_data(ALERTS_FILE)
-        if not isinstance(sent_alerts, dict): sent_alerts = {}
+        if not isinstance(sent_alerts, dict):
+            sent_alerts = {}
         for t in data:
             target = t.get('timestamp')
-            if not target or (now - target > 172800): continue
+            if not target or (now - target > 172800):
+                continue
             chan = discord.utils.get(guild.text_channels, name=SUBJECT_CHANNELS.get(t['subject']))
             if not chan:
                 rem.append(t)
@@ -645,18 +791,20 @@ class GigaBot(discord.Client):
                 for key in SUBJECT_CHANNELS.keys():
                     if key in name:
                         return key
-        # Updated fallback to a valid new subject
         return "web design"
 
     async def refresh_master_embed(self):
         config = load_data(CONFIG_FILE)
-        if not config: return
+        if not config:
+            return
         channel_id = config.get('request_channel_id')
         message_id = config.get('master_message_id')
-        if not channel_id or not message_id: return
+        if not channel_id or not message_id:
+            return
         try:
             channel = self.get_channel(channel_id)
-            if not channel: return
+            if not channel:
+                return
             msg = await channel.fetch_message(message_id)
             library = load_data(LIBRARY_FILE)
             total = sum(len(v) for v in library.values())
@@ -688,9 +836,11 @@ class GigaBot(discord.Client):
                 loop = asyncio.get_event_loop()
                 res = await loop.run_in_executor(None, lambda u=url: requests.get(u, timeout=20))
                 path = TEMP_DIR / f_name
-                with open(path, "wb") as f: f.write(res.content)
+                with open(path, "wb") as f:
+                    f.write(res.content)
                 content = f"📚 New material for **{course_name}**!\n<@&{DEAD_GPA_ROLE_ID}>"
-                if description: content += f"\n\n📝 **Professor's Note:**\n{description}"
+                if description:
+                    content += f"\n\n📝 **Professor's Note:**\n{description}"
                 await chan.send(content=content, file=discord.File(path))
                 path.unlink()
             except Exception as e:
@@ -725,131 +875,141 @@ class GigaBot(discord.Client):
             await ctx.add_reaction("⏳")
 
         loop = asyncio.get_event_loop()
+        lower_url = url.lower()
 
-        # Determine platform for styling
-        if "tiktok.com" in url:
-            platform = "TikTok"
-            platform_emoji = "🎵"
-            color = discord.Color.teal()
-        elif "instagram.com" in url:
-            platform = "Instagram"
-            platform_emoji = "📸"
-            color = discord.Color.magenta()
-        elif "facebook.com" in url or "fb.watch" in url:
-            platform = "Facebook"
-            platform_emoji = "📘"
-            color = discord.Color.blue()
-        elif "youtube.com" in url or "youtu.be" in url:
-            platform = "YouTube"
-            platform_emoji = "▶️"
-            color = discord.Color.red()
+        if "tiktok.com" in lower_url:
+            platform, platform_emoji, color = "TikTok", "🎵", discord.Color.teal()
+        elif "instagram.com" in lower_url:
+            platform, platform_emoji, color = "Instagram", "📸", discord.Color.magenta()
+        elif "facebook.com" in lower_url or "fb.watch" in lower_url:
+            platform, platform_emoji, color = "Facebook", "📘", discord.Color.blue()
+        elif "youtube.com" in lower_url or "youtu.be" in lower_url:
+            platform, platform_emoji, color = "YouTube", "▶️", discord.Color.red()
+        elif "pinterest.com" in lower_url or "pin.it" in lower_url:
+            platform, platform_emoji, color = "Pinterest", "📌", discord.Color.from_rgb(230, 0, 35)
         else:
-            platform = "Video"
-            platform_emoji = "🔗"
-            color = discord.Color.greyple()
-
-        # 1. Fetch Metadata
-        metadata = await loop.run_in_executor(None, get_video_metadata, url)
-        if not metadata:
-            msg = "❌ Could not fetch video info. The link may be private, expired, or unsupported."
-            return await ctx.followup.send(msg) if is_slash else await ctx.reply(msg)
-
-        # Extract info
-        author = metadata.get('uploader', 'Unknown')
-        description = (metadata.get('description') or metadata.get('title', 'No description')).strip()
-        if len(description) > 1000:
-            description = description[:997] + "..."
-
-        likes = format_count(metadata.get('like_count', 0))
-        comments = format_count(metadata.get('comment_count', 0))
-        shares = format_count(metadata.get('repost_count', 0) or metadata.get('share_count', 0))
+            platform, platform_emoji, color = "Video", "🔗", discord.Color.greyple()
 
         clean_url = url.split('?')[0]
+        is_instagram = "instagram.com" in lower_url
 
-        # 2. Download the file (Protected by lock to prevent RAM spikes)
-        async with download_lock:
-            path = TEMP_DIR / f"vid_{int(time.time())}.mp4"
-
-            # Route YouTube to Cobalt (bypasses Azure IP bans), use yt-dlp for the rest
-            if "youtube.com" in url or "youtu.be" in url:
-                success = await download_youtube_via_cobalt(url, str(path))
-            else:
-                success = await loop.run_in_executor(None, download_video_file, url, str(path))
-
-        # Fallback if download fails but metadata succeeded
-        if not success or not path.exists():
-            embed = discord.Embed(title=f"{platform_emoji} {platform} Video", description=description or "No description", color=color)
-            embed.add_field(name="👤 Author", value=author, inline=True)
-            embed.add_field(name="📊 Stats", value=f"❤️ {likes} | 💬 {comments} | 🔁 {shares}", inline=False)
-            embed.url = clean_url
-
-            if is_slash:
-                await ctx.followup.send(content="⚠️ Download failed, but here is the video info:", embed=embed)
-            else:
-                await ctx.reply(content="⚠️ Download failed, but here is the video info:", embed=embed)
-                await ctx.add_reaction("❌")
-            return
-
-        # 3. Check file size and build the SUCCESS embed
-        file_size_mb = path.stat().st_size / (1024 * 1024)
-
-        # Build the clean embed (Putting links inside the embed prevents Discord from auto-generating messy preview boxes)
-        embed = discord.Embed(
-            title=f"{platform_emoji} {platform} Video",
-            description=description if description else "No description available.",
-            color=color,
-            url=clean_url
-        )
-        embed.add_field(name="👤 Author", value=f"[{author}]({clean_url})", inline=True)
-        embed.add_field(name="📊 Stats", value=f"❤️ {likes}  •  💬 {comments}  •  🔁 {shares}", inline=True)
-        embed.add_field(name="💾 File Size", value=f"**{file_size_mb:.1f} MB**", inline=False)
-        embed.set_footer(text="Powered by Mango Man")
-
-        # 4. Create interactive buttons
-        view = discord.ui.View()
-        view.add_item(discord.ui.Button(label=f"Open in {platform}", url=clean_url, style=discord.ButtonStyle.link, emoji=platform_emoji))
-
-        # Try to get a direct download link for the button using yt-dlp (Async safe)
+        metadata = await loop.run_in_executor(None, get_video_metadata, url)
         direct_url = clean_url
-        try:
-            res = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(["yt-dlp", "-g", "--no-warnings", url], capture_output=True, text=True, timeout=15)
+        if metadata:
+            direct_url = metadata.get("url") or (
+                metadata["requested_formats"][0].get("url")
+                if metadata.get("requested_formats") else clean_url
             )
-            if res.returncode == 0 and res.stdout.strip():
-                direct_url = res.stdout.strip().split('\n')[0]
-        except Exception:
-            pass # Fallback to clean_url if direct fetch fails
 
-        # Discord limits button URLs to 512 characters. Only add if it fits.
-        if len(direct_url) <= 512:
-            view.add_item(discord.ui.Button(label="Download Video", url=direct_url, style=discord.ButtonStyle.link, emoji="📥"))
+        file_stem = f"vid_{int(time.time())}"
+        path = TEMP_DIR / f"{file_stem}.mp4"
+        success = False
 
-        # 5. Send the message
-        if file_size_mb > 20:
-            # File too large, send embed with download link but no file attachment
-            msg_content = f"⚠️ File is too large to upload directly ({file_size_mb:.1f} MB > 20 MB limit). Use the download button below!"
-            if is_slash:
-                await ctx.followup.send(content=msg_content, embed=embed, view=view)
+        try:
+            async with download_lock:
+                has_video = bool(metadata) and (
+                    (metadata.get("vcodec") or "none") != "none"
+                    or any((f.get("vcodec") or "none") != "none" for f in (metadata.get("formats") or []))
+                )
+                if "youtube.com" in lower_url or "youtu.be" in lower_url:
+                    if metadata:
+                        success = await download_youtube_via_cobalt(url, str(path))
+                elif has_video:
+                    success = await loop.run_in_executor(None, download_video_file, url, str(path))
+
+                if is_instagram and (not success or not path.exists()):
+                    logger.info(f"yt-dlp failed for {url}; switching to RapidAPI fallback...")
+                    api_meta, api_direct_url = await download_instagram_via_rapidapi(url, str(path))
+                    if api_meta and path.exists():
+                        metadata = metadata or api_meta
+                        direct_url = api_direct_url or clean_url
+                        success = True
+            proxy_url = await get_embed_proxy_url(url)
+
+            if not metadata:
+                if proxy_url:
+                    fallback_text = f"⚠️ Direct download failed — watch inline via embed proxy:\n{proxy_url}"
+                    if is_slash:
+                        await ctx.followup.send(content=fallback_text)
+                    else:
+                        target = discord.utils.get(self.get_guild(GUILD_ID).text_channels, name=TARGET_CHANNEL_NAME) or ctx.channel
+                        await target.send(content=fallback_text)
+                        await ctx.add_reaction("🔗")
+                    return
+
+                msg = "❌ Could not fetch video info. The link may be private, image-only, expired, or unsupported."
+                if not is_slash:
+                    await ctx.add_reaction("❌")
+                return await ctx.followup.send(msg) if is_slash else await ctx.reply(msg)
+
+            author = metadata.get('uploader') or metadata.get('channel') or 'Unknown'
+            description = (metadata.get('description') or metadata.get('title') or 'No description').strip()
+            if len(description) > 1000:
+                description = description[:997] + "..."
+
+            likes = format_count(metadata.get('like_count', 0))
+            comments = format_count(metadata.get('comment_count', 0))
+            shares = format_count(metadata.get('repost_count', 0) or metadata.get('share_count', 0))
+
+            if not success or not path.exists():
+                embed = discord.Embed(title=f"{platform_emoji} {platform} Video", description=description, color=color, url=clean_url)
+                embed.add_field(name="👤 Author", value=author, inline=True)
+                embed.add_field(name="📊 Stats", value=f"❤️ {likes} | 💬 {comments} | 🔁 {shares}", inline=False)
+                fallback_text = (
+                    f"⚠️ Direct download failed — watch inline via embed proxy:\n{proxy_url}"
+                    if proxy_url else "⚠️ Download failed, but here is the video info:"
+                )
+                if is_slash:
+                    await ctx.followup.send(content=fallback_text, embed=embed)
+                else:
+                    target = discord.utils.get(self.get_guild(GUILD_ID).text_channels, name=TARGET_CHANNEL_NAME) or ctx.channel
+                    await target.send(content=fallback_text, embed=embed)
+                    await ctx.add_reaction("🔗" if proxy_url else "❌")
+                return
+
+            file_size_mb = path.stat().st_size / (1024 * 1024)
+            embed = discord.Embed(
+                title=f"{platform_emoji} {platform} Video",
+                description=description,
+                color=color,
+                url=clean_url
+            )
+            embed.add_field(name="👤 Author", value=f"[{author}]({clean_url})", inline=True)
+            embed.add_field(name="📊 Stats", value=f"❤️ {likes}  •  💬 {comments}  •  🔁 {shares}", inline=True)
+            embed.add_field(name="💾 File Size", value=f"**{file_size_mb:.1f} MB**", inline=False)
+            embed.set_footer(text="Powered by Mango Man")
+
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label=f"Open in {platform}", url=clean_url, style=discord.ButtonStyle.link, emoji=platform_emoji))
+            if direct_url and len(direct_url) <= 512:
+                view.add_item(discord.ui.Button(label="Download Video", url=direct_url, style=discord.ButtonStyle.link, emoji="📥"))
+
+            if file_size_mb > 20:
+                msg_content = f"⚠️ File is too large to upload directly ({file_size_mb:.1f} MB > 20 MB limit). Use the download button below!"
+                if is_slash:
+                    await ctx.followup.send(content=msg_content, embed=embed, view=view)
+                else:
+                    target = discord.utils.get(self.get_guild(GUILD_ID).text_channels, name=TARGET_CHANNEL_NAME) or ctx.channel
+                    await target.send(content=msg_content, embed=embed, view=view)
             else:
-                target = discord.utils.get(self.get_guild(GUILD_ID).text_channels, name=TARGET_CHANNEL_NAME) or ctx.channel
-                await target.send(content=msg_content, embed=embed, view=view)
-        else:
-            # File is good, send embed + file attachment + buttons
-            if is_slash:
-                await ctx.followup.send(embed=embed, file=discord.File(path), view=view)
-            else:
-                target = discord.utils.get(self.get_guild(GUILD_ID).text_channels, name=TARGET_CHANNEL_NAME) or ctx.channel
-                await target.send(embed=embed, file=discord.File(path), view=view)
+                if is_slash:
+                    await ctx.followup.send(embed=embed, file=discord.File(path), view=view)
+                else:
+                    target = discord.utils.get(self.get_guild(GUILD_ID).text_channels, name=TARGET_CHANNEL_NAME) or ctx.channel
+                    await target.send(embed=embed, file=discord.File(path), view=view)
 
-        # Cleanup temp file
-        if path.exists():
-            path.unlink()
-        if not is_slash:
-            await ctx.add_reaction("✅")
+            if not is_slash:
+                await ctx.add_reaction("✅")
+        finally:
+            for leftover in TEMP_DIR.glob(f"{file_stem}*"):
+                try:
+                    leftover.unlink()
+                except Exception:
+                    pass
 
     async def on_message(self, message):
-        if message.author == self.user: return
+        if message.author == self.user:
+            return
         if message.guild is None:
             log_chan = self.get_channel(DM_LOG_CHANNEL_ID)
             if log_chan:
@@ -858,29 +1018,42 @@ class GigaBot(discord.Client):
                 await log_chan.send(embed=embed)
             return
         if getattr(message.channel, 'name', None) == LISTEN_CHANNEL_NAME:
-            m = re.search(r'https?://(?:vt|vm|www|m)?\.?tiktok\.com/[^\s<>"\']+|https?://(?:www\.)?instagram\.com/(?:reel|p)/[^\s<>"\']+', message.content)
-            if m: await self.process_media(message, m.group(0))
+            m = re.search(
+                r'https?://(?:vt|vm|www|m)?\.?tiktok\.com/[^\s<>"\']+|'
+                r'https?://(?:www\.)?instagram\.com/(?:reels?|p)/[^\s<>"\']+|'
+                r'https?://(?:[a-z]{2,3}\.)?pinterest\.com/pin/[^\s<>"\']+|'
+                r'https?://pin\.it/[^\s<>"\']+',
+                message.content
+            )
+            if m:
+                await self.process_media(message, m.group(0))
 
     @tasks.loop(minutes=5)
     async def check_academy_results(self):
         await self.wait_until_ready()
         sent_results = load_data(RESULTS_CACHE_FILE)
-        if not isinstance(sent_results, list): sent_results = []
+        if not isinstance(sent_results, list):
+            sent_results = []
         rush_the_rest = False
         for discord_id, student_code in STUDENT_MAPPING.items():
-            if str(student_code) in [str(c) for c in sent_results]: continue
+            if str(student_code) in [str(c) for c in sent_results]:
+                continue
             pdf_path = await self.fetch_results_pdf(student_code)
             if pdf_path:
                 try:
                     user = await self.fetch_user(discord_id)
                     if user:
-                        await user.send(content=f"📊 **Academic Results Released!**\nHere is your private results file for student code: `{student_code}`.", file=discord.File(pdf_path))
+                        await user.send(
+                            content=f"📊 **Academic Results Released!**\nHere is your private results file for student code: `{student_code}`.",
+                            file=discord.File(pdf_path)
+                        )
                         sent_results.append(str(student_code))
                         save_data(RESULTS_CACHE_FILE, sent_results)
                 except Exception as e:
                     logger.error(f"⚠️ Failed to send DM to Discord ID {discord_id}: {e}")
                 finally:
-                    if os.path.exists(pdf_path): os.remove(pdf_path)
+                    if os.path.exists(pdf_path):
+                        os.remove(pdf_path)
                 rush_the_rest = True
             await asyncio.sleep(0 if rush_the_rest else 10)
 
@@ -957,15 +1130,16 @@ class AssignmentModal(discord.ui.Modal, title="📝 Add New Assignment"):
         data.append(task)
         save_data(ASSIGNMENTS_FILE, data)
         channel = discord.utils.get(interaction.guild.text_channels, name=SUBJECT_CHANNELS.get(self.subject_value))
-        if channel: await bot.send_stacked_embed(channel, task, "📌 NEW ASSIGNMENT LOGGED (Fast)", include_images=False)
+        if channel:
+            await bot.send_stacked_embed(channel, task, "📌 NEW ASSIGNMENT LOGGED (Fast)", include_images=False)
         await interaction.response.send_message(f"✅ Assignment logged for **{self.subject_value}** due <t:{ts}:F>.", ephemeral=True)
+
 class ArchiveSetupView(discord.ui.View):
     def __init__(self, library_keys):
-        super().__init__(timeout=300)  # 5 minute timeout
+        super().__init__(timeout=300)
         self.target_channel_id = None
         self.selected_subjects = []
 
-        # Dynamically create subject options (max 25 for Discord select menus)
         subject_options = []
         for subj in list(library_keys)[:25]:
             subject_options.append(discord.SelectOption(label=subj[:100], value=subj))
@@ -999,7 +1173,6 @@ class ArchiveSetupView(discord.ui.View):
     async def channel_callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("❌ Admins only!", ephemeral=True)
-        # FIX: Store the channel ID instead of the AppCommandChannel object
         self.target_channel_id = self.channel_select.values[0].id
         self._check_ready(interaction)
 
@@ -1015,7 +1188,6 @@ class ArchiveSetupView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(f"⏳ Starting archive process for **{len(self.selected_subjects)}** subject(s). This may take a while...", ephemeral=True)
 
-        # FIX: Fetch the actual TextChannel object using the ID
         target_channel = interaction.client.get_channel(self.target_channel_id)
         if not target_channel:
             return await interaction.followup.send("❌ Could not find the target channel. Make sure the bot has access to it.", ephemeral=True)
@@ -1030,10 +1202,7 @@ class ArchiveSetupView(discord.ui.View):
             if not files:
                 continue
 
-            # Sort oldest first
             sorted_files = sorted(files, key=lambda x: x['timestamp'])
-
-            # Send header (NO MENTIONS)
             await target_channel.send(f"📂 **Archiving: {subj.upper()}** ({len(sorted_files)} files)")
 
             for f in sorted_files:
@@ -1056,9 +1225,7 @@ class ArchiveSetupView(discord.ui.View):
                         path.unlink()
 
                     processed += 1
-                    # CRITICAL: Rate limit protection (prevents Discord from blocking the bot)
                     await asyncio.sleep(1.2)
-
                 except Exception as e:
                     logger.error(f"Failed to archive file {f['name']}: {e}")
                     await target_channel.send(f"⚠️ Failed to process: `{f['name']}`")
@@ -1073,14 +1240,14 @@ class ArchiveSetupView(discord.ui.View):
 async def assignment_v2(interaction: discord.Interaction, subject: app_commands.Choice[str], type: app_commands.Choice[str]):
     await interaction.response.send_modal(AssignmentModal(subject.value, type.value))
 
-@bot.tree.command(name="dow", description="Download a video from TikTok, Instagram, Facebook, or YouTube")
+@bot.tree.command(name="dow", description="Download a video from TikTok, Instagram, Facebook, YouTube, or Pinterest")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(url="The video URL to download")
 async def download_video(interaction: discord.Interaction, url: str):
-    if not any(x in url.lower() for x in ["tiktok.com", "instagram.com", "facebook.com", "fb.watch", "youtube.com", "youtu.be"]):
+    if not any(x in url.lower() for x in ["tiktok.com", "instagram.com", "facebook.com", "fb.watch", "youtube.com", "youtu.be", "pinterest.com", "pin.it"]):
         return await interaction.response.send_message(
-            "❌ Please provide a valid TikTok, Instagram, Facebook, or YouTube link.",
+            "❌ Please provide a valid TikTok, Instagram, Facebook, YouTube, or Pinterest link.",
             ephemeral=True
         )
     await bot.process_media(interaction, url, is_slash=True)
@@ -1090,16 +1257,14 @@ async def download_video(interaction: discord.Interaction, url: str):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.describe(code="Student code or 14-digit national ID")
 async def schedule_command(interaction: discord.Interaction, code: str):
-    # ... rest of your schedule command code ...
     await interaction.response.defer(ephemeral=True)
 
     clean_code = code.strip()
     is_national_id = bool(re.match(r"^[0-9]{14}$", clean_code))
 
-    headers = {"x-api-key": "MAM_ULTRA_2026"}
+    headers = {"x-api-key": os.getenv("COLLEGE_API_KEY", "MAM_ULTRA_2026")}
     base_url = "http://mamstd.fahadalsheref.com"
 
-    # Lecture times extracted directly from the college webpage
     LECTURE_TIMES = {
         "1": "08:30 - 09:40", "2": "09:45 - 10:55", "3": "11:00 - 12:10",
         "4": "12:15 - 01:25", "5": "01:30 - 02:40", "6": "02:45 - 03:55",
@@ -1128,7 +1293,6 @@ async def schedule_command(interaction: discord.Interaction, code: str):
             if not student or not rows:
                 return await interaction.followup.send("⚠️ No registered classes found or tuition fees may not be paid.", ephemeral=True)
 
-            # Group by Section (if available)
             sections = {}
             for r in rows:
                 sec = str(r.get("section_no") or r.get("SECTION") or r.get("السكشن") or "غير محدد").strip()
@@ -1139,22 +1303,19 @@ async def schedule_command(interaction: discord.Interaction, code: str):
             embed = discord.Embed(
                 title="📚 جدولك الدراسي | الأكاديمية الحديثة",
                 description="العام الدراسي 2026–2027 · اعرف مواعيد محاضراتك وأماكنها بكل وضوح.",
-                color=0x2C3E50 # Dark blue/grey matching the college theme
+                color=0x2C3E50
             )
 
-            # Student Info Header (matching webpage)
             embed.add_field(name="🆔 كود الطالب", value=str(student.get('student_id', '-')), inline=True)
             embed.add_field(name="👤 اسم الطالب", value=str(student.get('student_name', '-')), inline=True)
             embed.add_field(name="🎓 التخصص", value=str(student.get('spec', '-')), inline=True)
             embed.add_field(name="📊 المستوى", value=str(student.get('level_name', '-')), inline=True)
-            embed.add_field(name="\u200b", value="\u200b", inline=True) # Spacer
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-            # Process each section
             for section_num, section_rows in sections.items():
                 if len(sections) > 1:
                     embed.add_field(name=f"📂 سكشن الطالب: {section_num}", value="\u200b", inline=False)
 
-                # Group section rows by Day
                 schedule_by_day = {day: [] for day in DAYS_ORDER}
                 other_days = []
 
@@ -1170,33 +1331,31 @@ async def schedule_command(interaction: discord.Interaction, code: str):
                     if not classes:
                         continue
 
-                    # Sort by lecture number
                     def get_lec_num(x):
-                        try: return int(x.get('lecture_no', 0))
-                        except: return 99
+                        try:
+                            return int(x.get('lecture_no', 0))
+                        except Exception:
+                            return 99
                     classes.sort(key=get_lec_num)
 
                     day_text = f"**{len(classes)} محاضرة**\n" + "━" * 20 + "\n"
 
                     for c in classes:
                         lec = str(c.get('lecture_no') or "-")
-                        time = LECTURE_TIMES.get(lec, "غير محدد")
+                        lec_time = LECTURE_TIMES.get(lec, "غير محدد")
                         mat = c.get("MAT") or c.get("MAT_NAME") or "مادة غير مسماة"
                         dr = c.get("DR_NAME") or "غير محدد"
                         place = c.get("PLACE") or "غير محدد"
 
-                        # Format mimicking the webpage's table cell
-                        day_text += f"🕐 **المحاضرة {lec}** (`{time}`)\n"
+                        day_text += f"🕐 **المحاضرة {lec}** (`{lec_time}`)\n"
                         day_text += f"📘 **{mat}**\n"
                         day_text += f"👨‍🏫 {dr} | 📍 {place}\n\n"
 
-                    # Discord field limit is 1024 characters
                     if len(day_text) > 1000:
                         day_text = day_text[:990] + "...\n*(تم الاختصار بسبب طول النص)*"
 
                     embed.add_field(name=f"📅 {day}", value=day_text, inline=False)
 
-                # Handle unmatched days
                 if other_days:
                     other_text = "━" * 20 + "\n"
                     for c in other_days:
@@ -1211,9 +1370,7 @@ async def schedule_command(interaction: discord.Interaction, code: str):
                         other_text = other_text[:990] + "..."
                     embed.add_field(name="📅 أيام أخرى", value=other_text, inline=False)
 
-            # Webpage Footer Info
             embed.set_footer(text="💡 معلومة عن دخول Moodle: اسم المستخدم هو كود الطالب، وكلمة المرور: رقم 1 ثم آخر خمسة أرقام من الرقم القومي.")
-
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
@@ -1221,10 +1378,20 @@ async def schedule_command(interaction: discord.Interaction, code: str):
             await interaction.followup.send("⚠️ A technical error occurred while communicating with the college server. Please try again later.", ephemeral=True)
 
 @bot.tree.command(name="assignment", description="Add a new assignment")
-@app_commands.describe(subject="The subject name", deadline="Deadline date (YYYY-MM-DD)", type="Type of task", details="Description or notes", image1="First image (optional)", image2="Second image (optional)", image3="Third image (optional)", image4="fourth image (optional)", image5="fifth image (optional)", image6="sixth image (optional)", image7="seventh image (optional)", image8="eightth image (optional)", image9="nineth image (optional)", image10="tenth image (optional)")
+@app_commands.describe(
+    subject="The subject name", deadline="Deadline date (YYYY-MM-DD)", type="Type of task", details="Description or notes",
+    image1="First image (optional)", image2="Second image (optional)", image3="Third image (optional)",
+    image4="Fourth image (optional)", image5="Fifth image (optional)", image6="Sixth image (optional)",
+    image7="Seventh image (optional)", image8="Eighth image (optional)", image9="Ninth image (optional)", image10="Tenth image (optional)"
+)
 @app_commands.choices(subject=[app_commands.Choice(name=k.title(), value=k) for k in SUBJECT_CHANNELS.keys()])
 @app_commands.choices(type=[app_commands.Choice(name="Lecture", value="Lecture"), app_commands.Choice(name="Section", value="Section")])
-async def add_assignment(interaction: discord.Interaction, subject: app_commands.Choice[str], deadline: str, type: app_commands.Choice[str], details: str, image1: discord.Attachment = None, image2: discord.Attachment = None, image3: discord.Attachment = None, image4: discord.Attachment = None, image5: discord.Attachment = None, image6: discord.Attachment = None, image7: discord.Attachment = None, image8: discord.Attachment = None, image9: discord.Attachment = None, image10: discord.Attachment = None):
+async def add_assignment(
+    interaction: discord.Interaction, subject: app_commands.Choice[str], deadline: str, type: app_commands.Choice[str], details: str,
+    image1: discord.Attachment = None, image2: discord.Attachment = None, image3: discord.Attachment = None,
+    image4: discord.Attachment = None, image5: discord.Attachment = None, image6: discord.Attachment = None,
+    image7: discord.Attachment = None, image8: discord.Attachment = None, image9: discord.Attachment = None, image10: discord.Attachment = None
+):
     try:
         ts = get_cairo_9am_timestamp(deadline)
     except Exception:
@@ -1234,7 +1401,8 @@ async def add_assignment(interaction: discord.Interaction, subject: app_commands
     data.append({"subject": subject.value, "timestamp": int(ts), "type": type.value, "details": details, "image_urls": images})
     save_data(ASSIGNMENTS_FILE, data)
     channel = discord.utils.get(interaction.guild.text_channels, name=SUBJECT_CHANNELS.get(subject.value))
-    if channel: await bot.send_stacked_embed(channel, data[-1], "📌 NEW ASSIGNMENT LOGGED", include_images=True)
+    if channel:
+        await bot.send_stacked_embed(channel, data[-1], "📌 NEW ASSIGNMENT LOGGED", include_images=True)
     await interaction.response.send_message(f"✅ Assignment logged for **{subject.name}** due <t:{ts}:F>.", ephemeral=True)
 
 @bot.tree.command(name="test_results_engine", description="Force test the Playwright PDF engine with Keyword Gate")
@@ -1318,11 +1486,15 @@ async def edit_assignment(interaction: discord.Interaction, subject: app_command
     for task in data:
         if task['subject'] == subject.value and task['timestamp'] == old_ts:
             found = True
-            if new_details: task['details'] = new_details
+            if new_details:
+                task['details'] = new_details
             if new_deadline:
-                try: task['timestamp'] = int(get_cairo_9am_timestamp(new_deadline))
-                except: return await interaction.response.send_message("❌ Invalid New Date.", ephemeral=True)
-            if new_image1: task['image_urls'] = [new_image1.url]
+                try:
+                    task['timestamp'] = int(get_cairo_9am_timestamp(new_deadline))
+                except Exception:
+                    return await interaction.response.send_message("❌ Invalid New Date.", ephemeral=True)
+            if new_image1:
+                task['image_urls'] = [new_image1.url]
             break
     if not found:
         return await interaction.response.send_message("❌ Assignment not found.", ephemeral=True)
@@ -1347,12 +1519,12 @@ async def list_assignments(interaction: discord.Interaction):
     embeds = []
     current_embed = discord.Embed(title="📋 Active Assignments & Quizzes", color=discord.Color.blue())
     char_count = 0
-    for subj, tasks in subjects.items():
+    for subj, tasks_list in subjects.items():
         field_value = ""
-        for t in tasks:
+        for t in tasks_list:
             ts = t['timestamp']
             status_icon = "🚨" if ts < time.time() else ("⚠️" if (ts - time.time()) < 86400 else "✅")
-            line = f"{status_icon} **{t.get('type', 'Task')}**: {t['details'][:50]}{'...' if len(t['details'])>50 else ''}\n   └ Due: <t:{ts}:F> (<t:{ts}:R>)\n\n"
+            line = f"{status_icon} **{t.get('type', 'Task')}**: {t['details'][:50]}{'...' if len(t['details']) > 50 else ''}\n   └ Due: <t:{ts}:F> (<t:{ts}:R>)\n\n"
             if len(field_value) + len(line) > 1024:
                 current_embed.add_field(name=f"📘 {subj.title()}", value=field_value, inline=False)
                 char_count += len(field_value)
@@ -1389,6 +1561,7 @@ async def view_assignments(interaction: discord.Interaction):
         def __init__(self, lookup):
             super().__init__(timeout=180)
             self.lookup = lookup
+
         @discord.ui.select(placeholder="Select an assignment to view details...", min_values=1, max_values=1, options=options)
         async def select_assignment(self, interaction: discord.Interaction, select: discord.ui.Select):
             task = self.lookup.get(select.values[0])
@@ -1430,19 +1603,20 @@ async def list_quizzes(interaction: discord.Interaction):
 async def help_command(interaction: discord.Interaction):
     config = load_data(CONFIG_FILE)
     archive_link = f"<#{config.get('request_channel_id')}>" if config.get('request_channel_id') else "#setup-archive-channel"
+    listen_chan = discord.utils.get(interaction.guild.text_channels, name=LISTEN_CHANNEL_NAME) if interaction.guild else None
+    listen_link = f"<#{listen_chan.id}>" if listen_chan else f"#{LISTEN_CHANNEL_NAME}"
+
     embed = discord.Embed(title="🥭 Mango Man User Guide", description="Welcome! I am here to streamline your study life at Modern Academy. Here is how you can use me:", color=discord.Color.gold())
-    embed.add_field(name="📅 Academic Schedule",value="• `/schedule [code]` - Look up your weekly lecture schedule using your student code or 14-digit national ID.",inline=False)
+    embed.add_field(name="📅 Academic Schedule", value="• `/schedule [code]` - Look up your weekly lecture schedule using your student code or 14-digit national ID.", inline=False)
     embed.add_field(name="📚 Assignments & Reminders", value="• `/assignment` - Log a new manual deadline with **up to 10 images**.\n• `/delete_assignment` - Remove an active assignment.\n• `/edit_assignment` - Update details or deadline of a task.\n• `/list_assignments` - View all upcoming tasks & quizzes.\n• `/list_quizzes` - View only Moodle Quizzes.\n• `/view_assignments` - Browse manual assignments privately.", inline=False)
     embed.add_field(name="📂 Moodle File Archive", value=f"• **Auto-Sync:** I automatically download new PDFs/PPTs from Moodle.\n• **Browse Files:** Use the dropdown menu in {archive_link} to select a subject.\n• **Download:** Select up to 10 files, and I will DM them to you with professor notes if there are any.", inline=False)
-    embed.add_field(name="📱 Social Media Downloader", value=f"• `/dow [url]` - Download TikTok or Instagram Reels without watermarks.\n• **Auto-Forward:** Send links in <#{discord.utils.get(interaction.guild.text_channels, name=LISTEN_CHANNEL_NAME).id}> to auto-download.", inline=False)
+    embed.add_field(name="📱 Social Media Downloader", value=f"• `/dow [url]` - Download videos from TikTok, Instagram, Facebook, YouTube, or Pinterest.\n• **Auto-Forward:** Send links in {listen_link} to auto-download.", inline=False)
     embed.set_footer(text="Mango Man v1.0")
     embed.set_thumbnail(url="https://i.ibb.co/Q7Sss5ps/mangoman.gif")
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="View Bot's REPO", url="https://github.com/khaled-0110/mango", style=discord.ButtonStyle.link, emoji="🐙"))
     await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
     await interaction.followup.send(content=f"Developed by <@{interaction.user.id}>", ephemeral=False)
-
-
 
 @bot.tree.command(name="setup_archive", description="Initialize or update the study archive menu")
 async def setup_archive(interaction: discord.Interaction):
@@ -1485,7 +1659,6 @@ async def move_user(interaction: discord.Interaction, user: discord.Member, time
     if not target_channels:
         return await interaction.response.send_message("❌ No other accessible voice channels to move to.", ephemeral=True)
     await interaction.response.defer()
-    import random
     for _ in range(times):
         try:
             await user.move_to(random.choice(target_channels))
@@ -1500,6 +1673,7 @@ async def move_user(interaction: discord.Interaction, user: discord.Member, time
     except Exception as e:
         logger.error(f"Return move error: {e}")
     await interaction.followup.send(f"✅ Successfully moved {user.mention} `{times}` times! They've been returned to `{original_channel.name}`.")
+
 @bot.tree.command(name="send_to_archive", description="Archive old subject materials via dropdowns (Admin Only)")
 async def send_to_archive(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -1515,18 +1689,26 @@ async def send_to_archive(interaction: discord.Interaction):
         view=view,
         ephemeral=True
     )
+
 # ==============================================================================
 # 8. TELEGRAM INTEGRATION & MAIN LOOP
 # ==============================================================================
 async def tg_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
-        m = re.search(r'https?://(?:vt|vm|www|m)?\.?tiktok\.com/[^\s<>"\']+|https?://(?:www\.)?instagram\.com/(?:reel|p)/[^\s<>"\']+', update.message.text)
+        m = re.search(
+            r'https?://(?:vt|vm|www|m)?\.?tiktok\.com/[^\s<>"\']+|'
+            r'https?://(?:www\.)?instagram\.com/(?:reels?|p)/[^\s<>"\']+|'
+            r'https?://(?:[a-z]{2,3}\.)?pinterest\.com/pin/[^\s<>"\']+|'
+            r'https?://pin\.it/[^\s<>"\']+',
+            update.message.text
+        )
         if m and DISCORD_WEBHOOK_URL:
             requests.post(DISCORD_WEBHOOK_URL, json={"content": update.message.text})
             await update.message.reply_text("🚀 Forwarded!")
 
 def run_telegram():
-    if not TELEGRAM_TOKEN: return
+    if not TELEGRAM_TOKEN:
+        return
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), tg_msg))
